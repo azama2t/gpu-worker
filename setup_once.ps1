@@ -5,8 +5,12 @@ $ErrorActionPreference = 'Continue'
 $pub = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgfXZQSVpRQRO03nnwBhALwsJ2TL7Y8iqHW1bG3jeYn drones-main'
 
 # 1. Tailscale
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if (-not (Test-Path 'C:\Program Files\Tailscale\tailscale.exe')) {
-  winget install --id Tailscale.Tailscale -e --silent --accept-package-agreements --accept-source-agreements
+  # fresh Windows may have no winget: install the official MSI directly
+  $msi = Join-Path $env:TEMP 'tailscale-setup.msi'
+  Invoke-WebRequest -UseBasicParsing -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+  Start-Process msiexec.exe -ArgumentList '/i', $msi, '/quiet', '/norestart' -Wait
 }
 
 # 2. OpenSSH Server
@@ -22,7 +26,7 @@ New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value 'C:\Wi
 # 3. Our key (admins read administrators_authorized_keys)
 $ak = 'C:\ProgramData\ssh\administrators_authorized_keys'
 if (-not (Test-Path $ak) -or -not (Select-String -Path $ak -SimpleMatch $pub -Quiet)) { Add-Content -Path $ak -Value $pub -Encoding ascii }
-icacls $ak /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+icacls $ak /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' | Out-Null   # SIDs: any Windows language
 $uk = Join-Path $env:USERPROFILE '.ssh\authorized_keys'
 New-Item -ItemType Directory -Force -Path (Split-Path $uk) | Out-Null
 if (-not (Test-Path $uk) -or -not (Select-String -Path $uk -SimpleMatch $pub -Quiet)) { Add-Content -Path $uk -Value $pub -Encoding ascii }
