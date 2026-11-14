@@ -24,30 +24,104 @@ param(
 )
 $ErrorActionPreference = 'Continue'
 $pub = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIgfXZQSVpRQRO03nnwBhALwsJ2TL7Y8iqHW1bG3jeYn drones-main'
+$SelfUrl = 'https://raw.githubusercontent.com/azama2t/gpu-worker/main/setup_once.ps1'
 if (-not $Root) { if (Test-Path 'D:\') { $Root = 'D:\worker' } else { $Root = 'C:\worker' } }
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+$ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is much faster without the progress bar
+
+# 0a. 32-bit PowerShell on 64-bit Windows breaks DISM/OpenSSH: relaunch the base setup in 64-bit
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+  Write-Host '32-bit PowerShell detected, relaunching in 64-bit...' -ForegroundColor Yellow
+  & "$env:WINDIR\sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "irm '$SelfUrl' | iex"
+  return
+}
+# 0b. Not admin: relaunch elevated (one UAC prompt)
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+  Write-Host 'Not administrator: relaunching elevated (press Yes in the UAC window)...' -ForegroundColor Yellow
+  Start-Process powershell.exe -Verb RunAs -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-Command', "irm '$SelfUrl' | iex"
+  return
+}
+
+function Get-File([string]$Url, [string]$Out) {
+  # unstable internet: 5 rounds, three different downloaders
+  for ($i = 1; $i -le 5; $i++) {
+    Remove-Item $Out -Force -ErrorAction SilentlyContinue
+    try { Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Out -TimeoutSec 300 } catch {}
+    if ((Test-Path $Out) -and (Get-Item $Out).Length -gt 100000) { return $true }
+    try { & curl.exe -L --retry 3 --retry-delay 5 -s -o $Out $Url } catch {}
+    if ((Test-Path $Out) -and (Get-Item $Out).Length -gt 100000) { return $true }
+    try { Start-BitsTransfer -Source $Url -Destination $Out -ErrorAction Stop } catch {}
+    if ((Test-Path $Out) -and (Get-Item $Out).Length -gt 100000) { return $true }
+    Write-Host "  download try $i failed, retry in 10 s: $Url" -ForegroundColor Yellow
+    Start-Sleep 10
+  }
+  return $false
+}
+function Install-Msi([string]$Msi) {
+  $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$Msi`"", '/qn', '/norestart' -Wait -PassThru
+  Write-Host "  msiexec exit $($p.ExitCode)"
+}
+$TS = 'C:\Program Files\Tailscale\tailscale.exe'
 
 if (-not $OnlyExtras) {
 # 1. Tailscale
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-if (-not (Test-Path 'C:\Program Files\Tailscale\tailscale.exe')) {
-  # fresh Windows may have no winget: install the official MSI directly
+if (-not (Test-Path $TS)) {
+  Write-Host '[1] Installing Tailscale...' -ForegroundColor Cyan
   $msi = Join-Path $env:TEMP 'tailscale-setup.msi'
-  Invoke-WebRequest -UseBasicParsing -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
-  Start-Process msiexec.exe -ArgumentList '/i', $msi, '/quiet', '/norestart' -Wait
-  Remove-Item $msi -Force -ErrorAction SilentlyContinue   # do not leave installers in TEMP
+  if (Get-File 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' $msi) { Install-Msi $msi }
+  Remove-Item $msi -Force -ErrorAction SilentlyContinue
+  if (-not (Test-Path $TS) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+    winget install -e --id Tailscale.Tailscale --silent --accept-package-agreements --accept-source-agreements
+  }
 }
 
-# 2. OpenSSH Server
-$cap = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
-if ($cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
-Set-Service sshd -StartupType Automatic
-Start-Service sshd
-if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
-  New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+# 2. OpenSSH Server: Windows capability -> GitHub MSI -> GitHub zip -> winget
+function Test-Sshd { [bool](Get-Service sshd -ErrorAction SilentlyContinue) }
+Write-Host '[2] OpenSSH Server...' -ForegroundColor Cyan
+if (-not (Test-Sshd)) {
+  try {
+    $cap = Get-WindowsCapability -Online -ErrorAction Stop | Where-Object Name -like 'OpenSSH.Server*'
+    if ($cap -and $cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null }
+  } catch { Write-Host "  Windows capability failed, using the GitHub build instead" -ForegroundColor Yellow }
 }
+if (-not (Test-Sshd)) {
+  $assets = @()
+  try { $assets = (Invoke-RestMethod -UseBasicParsing 'https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases' -TimeoutSec 60)[0].assets } catch {}
+  $msiA = $assets | Where-Object { $_.name -like '*Win64*.msi' } | Select-Object -First 1
+  if ($msiA) {
+    $msi = Join-Path $env:TEMP 'openssh.msi'
+    if (Get-File $msiA.browser_download_url $msi) { Install-Msi $msi }
+    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+  }
+  if (-not (Test-Sshd)) {
+    $zipUrl = ($assets | Where-Object { $_.name -eq 'OpenSSH-Win64.zip' } | Select-Object -First 1).browser_download_url
+    if (-not $zipUrl) { $zipUrl = 'https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip' }
+    $zip = Join-Path $env:TEMP 'OpenSSH-Win64.zip'
+    if (Get-File $zipUrl $zip) {
+      Expand-Archive $zip -DestinationPath $env:ProgramFiles -Force
+      $dir = Join-Path $env:ProgramFiles 'OpenSSH-Win64'
+      if (Test-Path "$dir\install-sshd.ps1") { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$dir\install-sshd.ps1" }
+    }
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+  }
+  if (-not (Test-Sshd) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+    winget install -e --id Microsoft.OpenSSH.Preview --silent --accept-package-agreements --accept-source-agreements
+  }
+}
+if (Test-Sshd) {
+  Set-Service sshd -StartupType Automatic
+  Start-Service sshd -ErrorAction SilentlyContinue
+} else { Write-Host '  OpenSSH Server could NOT be installed - see messages above' -ForegroundColor Red }
+if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+  try { New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Profile Any -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction Stop | Out-Null }
+  catch { netsh advfirewall firewall add rule name="OpenSSH-Server-In-TCP" dir=in action=allow protocol=TCP localport=22 profile=any | Out-Null }
+} else { Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled True -Profile Any -ErrorAction SilentlyContinue }
+New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force -ErrorAction SilentlyContinue | Out-Null
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -PropertyType String -Force | Out-Null
 
 # 3. Our key (admins read administrators_authorized_keys)
+New-Item -ItemType Directory -Force -Path 'C:\ProgramData\ssh' | Out-Null
 $ak = 'C:\ProgramData\ssh\administrators_authorized_keys'
 if (-not (Test-Path $ak) -or -not (Select-String -Path $ak -SimpleMatch $pub -Quiet)) { Add-Content -Path $ak -Value $pub -Encoding ascii }
 icacls $ak /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' | Out-Null   # SIDs: any Windows language
@@ -160,11 +234,32 @@ Log "free $free GB"
 }
 
 if (-not $OnlyExtras) {
-# 8. Tailscale login (browser opens once) and summary
-& 'C:\Program Files\Tailscale\tailscale.exe' up --unattended
+# 8. Tailscale login (browser opens once), self-check and summary
+Restart-Service sshd -ErrorAction SilentlyContinue
+$ip = $null
+for ($i = 1; $i -le 3; $i++) {
+  & $TS up --unattended
+  $ip = (& $TS ip -4 2>$null | Select-Object -First 1)
+  if ($ip) { break }
+  Write-Host "  Tailscale not connected yet (try $i), retry in 15 s" -ForegroundColor Yellow
+  Start-Sleep 15
+}
 Write-Host ''
-Write-Host 'DONE. Send these 3 lines to the operator (Tailscale IP, PC name, user):' -ForegroundColor Green
-& 'C:\Program Files\Tailscale\tailscale.exe' ip -4
+Write-Host '=== SELF-CHECK ===' -ForegroundColor Cyan
+$script:ok = $true
+function Chk([string]$Name, [bool]$Pass, [string]$Hint) {
+  if ($Pass) { Write-Host "OK    $Name" -ForegroundColor Green } else { Write-Host "FAIL  $Name -> $Hint" -ForegroundColor Red; $script:ok = $false }
+}
+$akf = 'C:\ProgramData\ssh\administrators_authorized_keys'
+Chk 'Tailscale installed' (Test-Path $TS) 'download failed: check internet and run the same command again'
+Chk 'Tailscale connected' ([bool]$ip) 'click the Tailscale tray icon, log in with the owner account, run again'
+Chk 'sshd service running' ((Get-Service sshd -ErrorAction SilentlyContinue).Status -eq 'Running') 'OpenSSH install failed: run again or send a photo'
+Chk 'port 22 listening' ([bool](Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue)) 'run: Restart-Service sshd'
+Chk 'operator key installed' ((Test-Path $akf) -and (Select-String -Path $akf -SimpleMatch $pub -Quiet)) 'run again'
+Write-Host ''
+if ($script:ok) { Write-Host 'DONE. Send these 3 lines to the operator (Tailscale IP, PC name, user):' -ForegroundColor Green }
+else { Write-Host 'NOT COMPLETE: run the same command again; if FAIL stays, send a photo of this window.' -ForegroundColor Red }
+$ip
 hostname
 whoami
 }
